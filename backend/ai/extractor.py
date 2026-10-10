@@ -11,55 +11,64 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_EXTRACTION_PROMPT = """
 You are an expert South Asian Real Estate Lead Extraction Engine.
-Analyze colloquial Roman-Urdu, Urdu Nastaliq, and English voice note transcripts and extract structured property lead details into valid JSON.
+Analyze colloquial Roman-Urdu, Urdu Nastaliq script, and English transcripts and extract structured property lead details into valid JSON.
 
-REGIONAL CONVENTIONS:
+REGIONAL PHONETIC & SCRIPT EQUIVALENCES (HANDLE TYPOS):
+- CITIES:
+  * "لہور", "لاہور", "lahore", "lhr" -> City: "Lahore"
+  * "اسلام آباد", "اسلامہ باد", "islamabad", "isb" -> City: "Islamabad"
+  * "گوجرانوالہ", "gujranwala", "grw" -> City: "Gujranwala"
+  * "کراچی", "karachi", "khi" -> City: "Karachi"
+  * "راولپنڈی", "پنڈی", "rawalpindi", "pindi" -> City: "Rawalpindi"
+  * "ملتان", "multan" -> City: "Multan"
+- NUMBER WORDS (CRITICAL):
+  * "ساتھ", "سات", "saat", "sat" -> 7
+  * "چھ", "chhe" -> 6
+  * "پانچ", "paanch" -> 5
+  * "چار", "char" -> 4
+  * "تین", "teen" -> 3
+  * "دو", "do" -> 2
+  * "ایک", "ek", "aik" -> 1
+  * "دس", "das" -> 10
+  * "بیس", "bees" -> 20
+  * "پچاس", "pachaas" -> 50
+- CURRENCY & AREA UNITS:
+  * "کروڈ", "پڑھوڑ", "کروڑ", "karor", "crore", "cr" -> crore
+  * "لاکھ", "لیکھ", "lac", "lakh" -> lac
+  * "مرلے", "مرلہ", "مدلے", "marla" -> marla
+  * "کنال", "kanal" -> kanal
 - INTENT:
-  * "bechna", "for sale", "demand", "available", "meri offer" -> SELL
-  * "khareedna", "chahiye", "require", "budget", "need", "talash" -> BUY
-- PROPERTY TYPES:
-  * "plot", "file", "parchi", "qist" -> PLOT
-  * "kothi", "makan", "ghar", "bangla", "flat", "apartment" -> HOUSE
-  * "plaza", "dukan", "shop", "office", "hall", "commercial" -> COMMERCIAL
-- MEASUREMENT & PRICING:
-  * Keep raw pricing expressions intact (e.g., '4 crore', '85 lac', '1.5 cr').
-  * Keep raw area expressions intact (e.g., '1 kanal', '10 marla', '500 gaz').
-- CLIENT & PHONE:
-  * Extract personal names and Pakistani phone numbers.
+  * "چاہیے", "خریدنا", "chahiye", "khareedna", "budget", "need", "require" -> BUY
+  * "بیچنا", "bechna", "for sale", "demand", "available" -> SELL
 
-Output ONLY valid JSON matching the schema directly. Zero conversational preambles.
+Output ONLY valid JSON matching this schema:
+{
+  "intent": "BUY" | "SELL",
+  "property_type": "PLOT" | "HOUSE" | "COMMERCIAL",
+  "city": "Lahore" | "Islamabad" | "Gujranwala" | "Karachi" | "Rawalpindi" | "Multan" | null,
+  "society": "string or null",
+  "raw_price": "exact price phrase (e.g. '3 crore', '80 lac') or null",
+  "raw_area": "exact area phrase (e.g. '7 marla', '1 kanal') or null",
+  "client_name": "string or null",
+  "client_phone": "string or null"
+}
 """
 
 BATCH_CHAT_PROMPT = """
 You are an expert Real Estate Intelligence Dissector.
 You are given a raw copy-pasted WhatsApp group chat log containing messages from multiple people.
-Your job is to:
-1. Ignore all personal small talk, greetings, banter, and jokes (e.g. 'kab tak ayoge', 'shuttle le ana', 'match kon jeeta').
-2. Identify messages where someone is buying, selling, or asking about real estate (plots, houses, shops, files).
+1. Ignore personal small talk, greetings, banter, and jokes (e.g. 'kab tak ayoge', 'shuttle le ana').
+2. Identify messages where someone is buying, selling, or asking about real estate.
 3. For EVERY valid real estate mention, extract a distinct property lead, tagging the sender's name from the chat log.
 
-Return a JSON array of leads matching this schema:
-[
-  {
-    "intent": "BUY" | "SELL",
-    "property_type": "PLOT" | "HOUSE" | "COMMERCIAL",
-    "city": "string",
-    "society": "string",
-    "raw_price": "string or null",
-    "raw_area": "string or null",
-    "client_name": "Sender Name from chat log",
-    "client_phone": "Phone number if present or null"
-  }
-]
-If no real estate leads exist, return an empty array []. Zero conversational text.
+Return a JSON array of leads matching the schema. If no leads exist, return [].
 """
 
 
 class LeadExtractor:
     """
     Hybrid Lead Extraction Engine:
-    - INTAKE_LLM_PROVIDER: Governs single voice notes & text leads.
-    - BATCH_LLM_PROVIDER: Governs 100-message bulk WhatsApp group chat logs.
+    Handles Nastaliq Urdu script, Roman-Urdu, English, and phonetic misspellings natively.
     """
 
     def __init__(self):
@@ -73,7 +82,6 @@ class LeadExtractor:
         self.ollama_model = settings.LOCAL_LLM_MODEL
 
     def extract(self, transcript: str, max_retries: int = 2) -> ExtractedPropertyLead:
-        """Extracts a single lead according to INTAKE_LLM_PROVIDER setting."""
         if not transcript or not transcript.strip():
             raise ValueError("Transcript cannot be empty.")
 
@@ -83,7 +91,6 @@ class LeadExtractor:
             return self._extract_via_ollama(transcript, max_retries)
 
     def extract_batch_chat(self, chat_log: str) -> List[dict]:
-        """Dissects bulk WhatsApp chat history according to BATCH_LLM_PROVIDER setting."""
         if not chat_log or not chat_log.strip():
             return []
 
@@ -92,9 +99,7 @@ class LeadExtractor:
         else:
             return self._extract_batch_via_ollama(chat_log)
 
-    # ==========================================
     # GOOGLE AI STUDIO (GEMINI 3.8 FLASH)
-    # ==========================================
     def _extract_via_gemini(self, transcript: str) -> ExtractedPropertyLead:
         print(f"\n[*] [GOOGLE AI STUDIO] Extracting single lead via {self.gemini_model}...")
         t0 = time.perf_counter()
@@ -127,7 +132,6 @@ class LeadExtractor:
 
         client = genai.Client(api_key=self.gemini_key)
 
-        # Direct schema generation with tools explicitly empty to kill the 100s AFC loop!
         response = client.models.generate_content(
             model=self.gemini_model,
             contents=f"{BATCH_CHAT_PROMPT}\n\nChat Log:\n\"\"\"{chat_log}\"\"\"",
@@ -143,9 +147,7 @@ class LeadExtractor:
         raw_items = json.loads(response.text)
         return raw_items if isinstance(raw_items, list) else [raw_items]
 
-    # ==========================================
-    # LOCAL OLLAMA (RTX 3060 QWEN3.5:9B)
-    # ==========================================
+    # LOCAL OLLAMA (QWEN 3.5:9B)
     def _extract_via_ollama(self, transcript: str, max_retries: int) -> ExtractedPropertyLead:
         print(f"\n[*] [GPU TENSOR COMPUTE] Qwen3.5-9B active on RTX 3060...")
         t0 = time.perf_counter()
@@ -164,7 +166,7 @@ class LeadExtractor:
 
         for attempt in range(max_retries + 1):
             try:
-                response = httpx.post(self.ollama_api_url, json=payload, timeout=120.0)
+                response = httpx.post(self.ollama_api_url, json=payload, timeout=60.0)
                 response.raise_for_status()
 
                 content = response.json()["message"]["content"]

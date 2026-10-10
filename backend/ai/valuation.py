@@ -90,10 +90,12 @@ class ValuationService:
         asking_price_pkr: int,
         estimated_price_pkr: int,
         lower_bound_pkr: int,
-        upper_bound_pkr: int
+        upper_bound_pkr: int,
+        listing_title: str = ""
     ) -> Dict[str, Any]:
         """
-        Calculates arbitrage divergence spread and outputs strategic negotiation advice.
+        Calculates arbitrage divergence spread. Detects installment file booking tokens
+        so initial down payments are not misclassified as cash discounts.
         """
         if asking_price_pkr <= 0 or estimated_price_pkr <= 0:
             return {
@@ -102,10 +104,21 @@ class ValuationService:
                 "recommendation": "Asking price or valuation cannot be zero."
             }
 
-        # Calculate percentage spread relative to fair market value
+        # Detect installment down payments / booking files on OLX
+        is_file_or_installment = any(
+            k in listing_title.lower() 
+            for k in ["file", "installment", "advance", "booking", "down payment", "qist", "qiston"]
+        )
+
         spread_pct = round(((asking_price_pkr - estimated_price_pkr) / estimated_price_pkr) * 100, 2)
 
-        if spread_pct < -15.0:
+        if is_file_or_installment and spread_pct < -40.0:
+            status = "INSTALLMENT_PLAN"
+            recommendation = (
+                f"Booking Token / Installment File. Asking price ({asking_price_pkr:,} PKR) "
+                f"is an initial down payment on an installment plan, not a lump-sum cash price."
+            )
+        elif spread_pct < -15.0:
             status = "UNDERPRICED_DEAL"
             recommendation = (
                 f"High-Value Deal! Asking price is {abs(spread_pct)}% below prevailing market value. "
@@ -120,8 +133,7 @@ class ValuationService:
         else:
             status = "FAIR_MARKET"
             recommendation = (
-                f"Fair Market Valuation. Price sits within reasonable +/-15% tolerance. "
-                f"Standard market negotiation applies."
+                f"Fair Market Valuation. Price sits within reasonable +/-15% tolerance."
             )
 
         return {

@@ -7,7 +7,7 @@ import tempfile
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
-
+from starlette.requests import Request
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -284,6 +284,8 @@ async def create_manual_lead(
     )
     wa_app_link = whatsapp_service.generate_wa_link(payload.client_phone, msg)
     wa_web_link = whatsapp_service.generate_wa_web_link(payload.client_phone, msg)
+
+
 
     features_dict = {
         "valuation": valuation_data,
@@ -569,11 +571,29 @@ async def trigger_modular_scrape(
         elif any(k in (title + " " + transcript).lower() for k in ["commercial", "shop", "plaza"]):
             prop_type = "COMMERCIAL"
 
+        # Compute CatBoost valuation and arbitrage rating for scraped listings
+        from backend.ai.valuation import valuation_service
+        val_pred = valuation_service.predict_fair_value(
+            city=city,
+            society=society,
+            phase="General",
+            property_type=prop_type,
+            area_sqft=area_sqft
+        )
+        deal_eval = valuation_service.evaluate_market_deal(
+            asking_price_pkr=price_pkr,
+            estimated_price_pkr=val_pred["estimated_price_pkr"],
+            lower_bound_pkr=val_pred["lower_bound_pkr"],
+            upper_bound_pkr=val_pred["upper_bound_pkr"]
+        )
+        val_payload = {**val_pred, **deal_eval}
+
         features_dict = {
             "listing_url": listing_url,
             "posted_date": posted_date,
             "scraped_title": title,
-            "data_source": source
+            "data_source": source,
+            "valuation": val_payload
         }
 
         stmt = text("""
@@ -659,7 +679,10 @@ async def get_leads(
     query = text(f"""
         SELECT 
             id, city, society, prop_type, intent, price_pkr, area_sqft,
-            created_at, features->>'listing_url' AS listing_url,
+            raw_transcript,
+            features->'valuation' AS valuation,
+            created_at, 
+            features->>'listing_url' AS listing_url,
             features->>'posted_date' AS posted_date,
             features->>'scraped_title' AS title,
             COALESCE(features->>'data_source', features->>'verified_source', features->>'source', 'manual_dealer') AS data_source,
@@ -724,6 +747,115 @@ REAL_ESTATE_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
+# ==========================================
+# 9. AUTONOMOUS WEB SCOUT & HUNTER API
+# ==========================================
+# ==========================================
+# 9. AUTONOMOUS WEB HUNTER ENDPOINTS
+# ==========================================
+class WebHunterRequest(BaseModel):
+    buyer_id: Optional[str] = None
+    city: str = "Gujranwala"
+    society: str = "Citi Housing"
+    property_type: str = "PLOT"
+    budget_pkr: int = 15000000
+    search_notes: Optional[str] = ""
+    duration_seconds: int = 60
+
+@app.post("/api/hunter/scout", status_code=status.HTTP_200_OK)
+async def trigger_web_hunter(
+    payload: WebHunterRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    from backend.ai.web_hunter import AutonomousWebHunter
+
+    result = await AutonomousWebHunter.hunt_for_lead(
+        buyer_lead_id=payload.buyer_id,
+        city=payload.city,
+        society=payload.society,
+        property_type=payload.property_type,
+        budget_pkr=payload.budget_pkr,
+        search_notes=payload.search_notes or "",
+        duration_seconds=payload.duration_seconds
+    )
+    return result
+
+@app.post("/api/hunter/stop", status_code=status.HTTP_200_OK)
+async def stop_web_hunter():
+    """Immediately stops all background searching loops."""
+    from backend.ai.web_hunter import AutonomousWebHunter
+    AutonomousWebHunter.request_cancel()
+    return {"status": "stopped"}
+
+@app.get("/api/hunter/findings", status_code=status.HTTP_200_OK)
+async def get_all_scout_findings(
+    db: AsyncSession = Depends(get_db)
+):
+    """Returns all scouted findings grouped by buyer lead."""
+    stmt = text("""
+        SELECT 
+            w.id AS scout_id, w.title, w.url, w.snippet, w.similarity_score, w.price_pkr, w.created_at,
+            p.id AS buyer_id, p.city, p.society, p.prop_type, p.price_pkr AS buyer_budget, p.raw_transcript
+        FROM web_scout_results w
+        LEFT JOIN properties p ON w.buyer_id = p.id
+        ORDER BY w.created_at DESC;
+    """)
+    rows = (await db.execute(stmt)).mappings().all()
+    return {"total": len(rows), "findings": [dict(r) for r in rows]}
+
+class ImportScoutRequest(BaseModel):
+    scout_id: str
+    city: str = "Gujranwala"
+    society: str = "General"
+    prop_type: str = "PLOT"
+    price_pkr: int = 15000000
+    title: str
+    url: str
+    snippet: str
+
+@app.post("/api/hunter/import", status_code=status.HTTP_201_CREATED)
+async def import_scout_to_inventory(
+    payload: ImportScoutRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Allows agent to promote a scouted web deal directly into the permanent property inventory."""
+    features_dict = {
+        "listing_url": payload.url,
+        "scraped_title": payload.title,
+        "data_source": "imported_from_scout",
+        "posted_date": "Imported Web Deal"
+    }
+
+    vec = embedding_engine.embed_text(f"{payload.city} {payload.society} {payload.prop_type} {payload.title}")
+
+    stmt = text("""
+        INSERT INTO properties (
+            intent, prop_type, city, society, price_pkr, area_sqft, 
+            raw_transcript, features, listing_url, embedding
+        ) VALUES (
+            'SELL'::property_intent,
+            CAST(:prop_type AS property_type),
+            :city, :society, :price_pkr, 2250.0,
+            :raw_transcript, CAST(:features AS jsonb), :listing_url,
+            CAST(:embedding AS vector)
+        )
+        ON CONFLICT (listing_url) DO NOTHING
+        RETURNING id;
+    """)
+
+    res = await db.execute(stmt, {
+        "prop_type": payload.prop_type,
+        "city": payload.city,
+        "society": payload.society,
+        "price_pkr": payload.price_pkr,
+        "raw_transcript": payload.snippet,
+        "features": json.dumps(features_dict),
+        "listing_url": payload.url,
+        "embedding": str(vec)
+    })
+    await db.commit()
+    row = res.fetchone()
+    return {"status": "imported", "property_id": str(row[0]) if row else None}
 # ==========================================
 # 9. FAIL-SAFE DEMO FIXTURES ENDPOINT
 # ==========================================
